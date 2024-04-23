@@ -119,7 +119,7 @@ class CricWikiFineTuner:
         )
 
         trainer.train()
-        self.model.save_pretrained('./google-gemma-2b-it-cric-SFTT')
+        self.model.save_pretrained('./Llama-2-7b-hf-cric-SFTT')
 
 
 if __name__ == "__main__":
