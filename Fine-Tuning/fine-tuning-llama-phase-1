@@ -1,0 +1,137 @@
+import torch
+import time
+import evaluate
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, DataCollatorForSeq2Seq
+from datasets import load_dataset
+from peft import LoraConfig, TaskType
+from trl import SFTTrainer
+
+class CricWikiDataLoader:
+    def __init__(self, dataset_name):
+        self.dataset = load_dataset(dataset_name)
+        self.train_data = pd.DataFrame(self.dataset['train'])
+
+    def display_dataset_info(self):
+        print("Dataset information:")
+        print(self.train_data.info())
+
+    def display_sample_dialogues(self):
+        print("\nSample dialogues and summaries:")
+        print(self.train_data.head())
+
+    def visualize_length_distribution(self):
+        self.train_data['text_len'] = self.train_data['text'].apply(lambda x: len(x.split()))
+        plt.figure(figsize=(10, 5))
+        plt.hist(self.train_data['text_len'], bins=10, alpha=0.7, color='blue', label='text_len')
+        plt.xlabel('Length')
+        plt.ylabel('Frequency')
+        plt.title('Length Distribution of Train Text')
+        plt.legend()
+        plt.show()
+
+class CricWikiModel:
+    def __init__(self, model_name):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.bfloat16)
+
+    def generate_summary(self, title, max_tokens=128):
+        prompt = f"What is {title}?"
+        inputs = self.tokenizer(prompt, return_tensors='pt').to('cuda')
+        output = self.model.generate(inputs['input_ids'], max_new_tokens=max_tokens)[0]
+        summary = self.tokenizer.decode(output, skip_special_tokens=True)
+        return summary
+
+    def evaluate_rouge(self, dataset, num_samples=500):
+        rouge = evaluate.load('rouge')
+        original_model_summaries = []
+        human_baseline_summaries = []
+
+        for index in range(num_samples):
+            title = dataset['train'][index]['title']
+            summary = dataset['train'][index]['text']
+            generated_summary = self.generate_summary(title)
+            original_model_summaries.append(generated_summary)
+            human_baseline_summaries.append(summary)
+
+        rouge_results = rouge.compute(
+            predictions=original_model_summaries,
+            references=human_baseline_summaries
+        )
+        return rouge_results
+
+class CricWikiFineTuner:
+    def __init__(self, tokenizer, model, dataset):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.dataset = dataset
+
+    def tokenize_examples(self, examples):
+        inputs = [f"What is {title}?" for title in examples["title"]]
+        labels = [summary for summary in examples["text"]]
+        tokenized_inputs = self.tokenizer(inputs, padding="max_length", truncation=True, return_tensors="pt", max_length=1024)
+        tokenized_labels = self.tokenizer(labels, padding="max_length", truncation=True, return_tensors="pt", max_length=1024)
+        return {
+            'input_ids': tokenized_inputs.input_ids,
+            'attention_mask': tokenized_inputs.attention_mask,
+            'labels': tokenized_labels.input_ids
+        }
+
+    def prepare_data(self):
+        tokenized_dataset = self.dataset.map(self.tokenize_examples, batched=True)
+        train_data, eval_data = torch.utils.data.random_split(tokenized_dataset, [int(0.90 * len(tokenized_dataset)), len(tokenized_dataset) - int(0.90 * len(tokenized_dataset))])
+        return train_data, eval_data
+
+    def fine_tune(self):
+        train_data, eval_data = self.prepare_data()
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=32,
+            lora_alpha=16,
+            lora_dropout=0.1
+        )
+        training_args = TrainingArguments(
+            output_dir="./output",
+            per_device_train_batch_size=1,
+            per_device_eval_batch_size=1,
+            gradient_accumulation_steps=1,
+            evaluation_strategy="steps",
+            max_steps=1000,
+            learning_rate=3e-3
+        )
+        data_collator = DataCollatorForSeq2Seq(self.tokenizer, model=self.model)
+        self.tokenizer.padding_side = 'right'
+
+        trainer = SFTTrainer(
+            model=self.model,
+            args=training_args,
+            packing=True,
+            dataset_text_field="id",
+            train_dataset=train_data,
+            eval_dataset=eval_data,
+            peft_config=lora_config,
+            data_collator=data_collator,
+            tokenizer=self.tokenizer,
+            max_seq_length=1024,
+        )
+
+        trainer.train()
+        self.model.save_pretrained('./google-gemma-2b-it-cric-SFTT')
+
+
+if __name__ == "__main__":
+    data_loader = CricWikiDataLoader("Ankush-Chander/cricket-wiki")
+    data_loader.display_dataset_info()
+    data_loader.display_sample_dialogues()
+    data_loader.visualize_length_distribution()
+
+    model = CricWikiModel("meta-llama/Llama-2-7b-hf")
+    rouge_results = model.evaluate_rouge(data_loader.dataset)
+    print('ROUGE Evaluation Results:')
+    print(rouge_results)
+
+    fine_tuner = CricWikiFineTuner(model.tokenizer, model.model, data_loader.dataset)
+    fine_tuner.fine_tune()
